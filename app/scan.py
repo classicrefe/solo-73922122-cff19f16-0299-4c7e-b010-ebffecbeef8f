@@ -5,10 +5,15 @@
 * 一个 source 同一时刻最多有一个活跃 ScanController（一代扫描，目录
   scans/<source_id>/gen<N>/）。同原件的在途任务都作为 Subscriber 挂到
   该控制器上，扫描线程只对原件做一次顺序读取。
-* 扫描线程把读入的每行原始字节写入本代 spool（磁盘日志），并即时投递给
-  所有订阅者；订阅者各自按自己的条件筛行，写自己的暂存 CSV。
-* 途中加入的订阅者先按 spool 已确认大小补读“已过部分”，再转入在线投递；
-  补读期间扫描线程会在追上点处等待，保证不会漏行，且全程不二次读取原件。
+* 扫描线程把校验通过的每一行赋予单调递增的**行序列号**，批量追加写入本代
+  spool（磁盘日志）；一批落盘并 flush 完成后，才在条件锁内发布
+  ``published_seq``（已可安全读取的行数）。序列号发布与订阅者的加入/读取
+  在同一把条件锁内对齐，是“不重不漏”的根基。
+* 订阅者只从 spool **拉取**自己尚未处理的序列号区间：加入时 ``next_seq=1``，
+  已发布的行全部在 spool 文件里（含加入之前的行），之后发布的行经条件变量
+  唤醒继续读取。全程没有内存快照、没有在线推送、没有第二数据源，因此
+  任何时刻加入都恰好按原顺序处理每行一次，原件中的重复行原样保留，
+  且绝不二次打开原件。
 * 只有整份原件解析通过后，订阅者才会把暂存原子改名为结果文件并置
   completed；任一行格式错误或扫描异常，本代所有未完任务 failed，
   不提供部分结果。
@@ -34,7 +39,7 @@ from .db import Database
 # 取消/结束事件的轮询粒度，保证“及时受理”
 POLL_INTERVAL = 0.05
 # spool 落盘批量：行数或字节数任一达到即 flush。
-# 只在 flush 后推进 spool_size，保证订阅者不会读到半行。
+# 一批先完整 flush 再发布序列号，订阅者永远不会读到半行。
 SPOOL_FLUSH_BYTES = 256 * 1024
 SPOOL_FLUSH_ROWS = 32
 
@@ -76,7 +81,7 @@ class TaskState:
 
 
 class Subscriber:
-    """订阅一次扫描的单个任务：负责补读 spool、在线筛行与结果落盘。"""
+    """订阅一次扫描的单个任务：从 spool 按序列号拉取、筛行并落盘结果。"""
 
     def __init__(self, state: TaskState, controller: "ScanController", db: Database):
         self.state = state
@@ -88,7 +93,9 @@ class Subscriber:
         self._io_lock = threading.Lock()  # 保护暂存文件的写/改名/删除
         self._staging = controller.dir / f"{state.task_id}.staging.csv"
         self._file = None
-        self.catching_up = True
+        # 下一条需要处理的行序列号（从 1 开始）。加入控制器时所有
+        # seq < next_seq 的行都已完整落在 spool 中，不会漏也不会重。
+        self.next_seq = 1
         self.cancel_requested = False
         self.retired = False
 
@@ -100,6 +107,8 @@ class Subscriber:
         self.cancel_requested = True
         self.state.status = "cancelling"
         self.db.update_task(self.state.task_id, status="cancelling", now=_now())
+        with self.controller.cond:
+            self.controller.cond.notify_all()
 
     def retire(self) -> None:
         """线程退出时的一次性收尾：关文件并按最终状态处理暂存。"""
@@ -126,30 +135,46 @@ class Subscriber:
         ctl = self.controller
         try:
             self._open_staging()
-            # 1) 补读加入之前已经扫过的部分（来自 spool，不碰原件）
-            self._catch_up()
-            # 2) 等待在线投递，直到扫描进入终态
-            with ctl.cond:
-                while ctl.state == "running":
-                    if self.cancel_requested:
-                        break
-                    ctl.cond.wait(timeout=POLL_INTERVAL)
+            # spool 在控制器创建时即 touch，订阅者可随时以 rb 打开；
+            # 只读到已发布序列号对应的字节，绝不读到半行。
+            with open(ctl.spool_path, "rb") as spool:
+                while True:
+                    with ctl.cond:
+                        while (
+                            ctl.state == "running"
+                            and ctl.published_seq < self.next_seq
+                            and not self.cancel_requested
+                        ):
+                            ctl.cond.wait(timeout=POLL_INTERVAL)
+                        state = ctl.state
+                        available = ctl.published_seq
 
-            # 3) 终态归一化
-            if self.cancel_requested and ctl.state == "running":
-                self._finish_cancelled()
-            elif ctl.state == "aborted":
-                # 用户主动取消仍记 cancelled；进程关闭导致的中止记 interrupted
-                if not self.cancel_requested and ctl.manager.shutting_down:
-                    self._finish_interrupted("服务关闭，任务中断")
-                else:
-                    self._finish_cancelled()
-            elif ctl.state == "error":
-                self._finish_failed(ctl.error or "扫描失败")
-            elif ctl.state == "complete":
-                self._finish_complete()
-            else:  # 理论上不可达，保守按失败处理
-                self._finish_failed(f"扫描处于未知状态 {ctl.state}")
+                    if self.cancel_requested and state == "running":
+                        self._finish_cancelled()
+                        return
+
+                    # 拉取本订阅者欠着的所有已发布行，每行恰好处理一次
+                    while self.next_seq <= available:
+                        line = spool.readline()
+                        if not line:  # 防御：序列号与文件内容理应一致
+                            break
+                        self._handle_line(line.decode("utf-8"))
+                        self.next_seq += 1
+
+                    if state == "complete":
+                        self._finish_complete()
+                        return
+                    if state == "error":
+                        self._finish_failed(ctl.error or "扫描失败")
+                        return
+                    if state == "aborted":
+                        # 用户主动取消记 cancelled；进程关闭导致的中止记 interrupted
+                        if not self.cancel_requested and ctl.manager.shutting_down:
+                            self._finish_interrupted("服务关闭，任务中断")
+                        else:
+                            self._finish_cancelled()
+                        return
+                    # state == "running" 且暂无新行：回到条件变量继续等
         except Exception as exc:  # 订阅者自身 IO 异常也算任务失败
             self._finish_failed(f"任务处理异常: {exc!r}")
         finally:
@@ -164,40 +189,6 @@ class Subscriber:
     def _open_staging(self) -> None:
         self._file = open(self._staging, "w", encoding="utf-8", newline="")
         self._file.write(",".join(HEADER) + "\r\n")
-
-    def _catch_up(self) -> None:
-        """补齐加入前已扫过的行；扫描线程会在追上点等待。
-
-        已扫行分两部分：
-        1. 已 flush 进 spool 文件的部分——只读 spool_size 确认字节，绝不会读到半行；
-        2. 扫描线程内存 _pending 中尚未 flush 的部分——在同一把条件锁内做一致性
-           快照（flush 会把 pending 原子地转入 spool，二者不会重复也不会遗漏）。
-        读取期间若 spool 增长，外层循环继续直到追平最新确认位置，保证不漏行。
-        全程只读 spool 与内存缓冲，不二次打开原件。
-        """
-        ctl = self.controller
-        with ctl.cond:
-            confirmed = ctl.spool_size
-            # 与 spool_size 在同一把锁内快照，flush 的原子性保证二者不重不漏
-            pending_snapshot = b"".join(ctl._pending).decode("utf-8")
-        with open(ctl.spool_path, "rb") as spool:
-            while not self.cancel_requested:
-                with ctl.cond:
-                    confirmed = ctl.spool_size
-                if spool.tell() >= confirmed:
-                    break
-                line = spool.readline()
-                if not line:
-                    break
-                self._handle_line(line.decode("utf-8"))
-        # 扫描线程在 catching_up 期间停在下一行的检查点，pending 不会再变化；
-        # 快照中的行在线投递阶段已被跳过，这里恰好补一次。
-        if not self.cancel_requested:
-            for line in pending_snapshot.splitlines(keepends=True):
-                self._handle_line(line)
-        with ctl.cond:
-            self.catching_up = False
-            ctl.cond.notify_all()
 
     def _handle_line(self, line: str) -> None:
         """对一行执行本任务的筛选并写暂存。行内容已由扫描线程校验。"""
@@ -271,7 +262,7 @@ class Subscriber:
 
 
 class ScanController:
-    """一代扫描：一个扫描线程 + 若干订阅者 + 独立暂存目录。"""
+    """一代扫描：一个扫描线程 + 若干拉取式订阅者 + 独立暂存目录。"""
 
     def __init__(
         self,
@@ -288,6 +279,8 @@ class ScanController:
         self.dir = config.SCANS_DIR / source_id / f"gen{generation}"
         self.dir.mkdir(parents=True, exist_ok=True)
         self.spool_path = self.dir / "spool.csv"
+        # 预创建 spool，保证订阅者线程任何时刻都能以 rb 打开
+        self.spool_path.touch()
         self.source_path = source_path
         self.row_delay_ms = row_delay_ms
 
@@ -296,7 +289,8 @@ class ScanController:
         # running -> complete / error / aborted
         self.state = "running"
         self.error: str | None = None
-        self.spool_size = 0  # 已 flush 的 spool 字节数（订阅者可安全读到这里）
+        # 已发布序列号：spool 中前 published_seq 行已完整 flush，可安全读取
+        self.published_seq = 0
         self.all_left = threading.Event()
         self.terminated = threading.Event()
         self.scanned_rows = 0  # 已从原件读取的数据行数（进度观测）
@@ -329,7 +323,7 @@ class ScanController:
 
     def _scan(self) -> None:
         with open(self.source_path, "r", encoding="utf-8", newline="") as src, open(
-            self.spool_path, "wb"
+            self.spool_path, "ab"
         ) as spool:
             header_line = src.readline()
             if not header_line:
@@ -342,29 +336,23 @@ class ScanController:
                 self.scanned_rows = line_no - 1
                 # 取消检查点：最后一个订阅者离开后尽快停下
                 with self.cond:
-                    while self._has_catching_up_subscriber():
-                        self.cond.wait(timeout=POLL_INTERVAL)
                     if self._stop_requested:
                         self._enter_aborted()
                         return
                 # 校验：整份原件全部合法才允许产出结果
                 parse_row(raw_line, line_no)
 
-                self._dispatch(raw_line)
-                self._buffer_for_spool(raw_line, spool)
+                self._buffer_and_maybe_publish(raw_line, spool)
 
                 if self.row_delay_ms > 0 and line_no % config.SCAN_DELAY_EVERY_ROWS == 0:
                     self._interruptible_sleep(self.row_delay_ms / 1000.0)
 
-            self._flush_spool(spool)
+            self._publish_batch(spool)  # EOF 末批：先落盘再发布 complete
 
         with self.cond:
             self.state = "complete"
             self.cond.notify_all()
         self.db.set_source_status(self.source_id, "validated")
-
-    def _has_catching_up_subscriber(self) -> bool:
-        return any(s.catching_up for s in self.subscribers)
 
     def _interruptible_sleep(self, seconds: float) -> None:
         deadline = time.monotonic() + seconds
@@ -374,38 +362,36 @@ class ScanController:
                     return
                 self.cond.wait(timeout=min(POLL_INTERVAL, deadline - time.monotonic()))
 
-    def _dispatch(self, line: str) -> None:
-        """把一行在线投递给已完成补读的订阅者。"""
-        for sub in list(self.subscribers):
-            if sub.catching_up or sub.cancel_requested:
-                continue
-            try:
-                sub._handle_line(line)
-            except Exception as exc:  # 单个任务异常不拖垮整代扫描
-                sub._finish_failed(f"任务处理异常: {exc!r}")
-
-    def _buffer_for_spool(self, raw_line: str, spool) -> None:
+    def _buffer_and_maybe_publish(self, raw_line: str, spool) -> None:
         # spool 以二进制追加，统一编码为 UTF-8，保留原件原始换行符
-        self._pending.append(raw_line.encode("utf-8"))
-        self._pending_bytes += len(self._pending[-1])
+        encoded = raw_line.encode("utf-8")
+        self._pending.append(encoded)
+        self._pending_bytes += len(encoded)
         self._pending_rows += 1
         if (
             self._pending_bytes >= SPOOL_FLUSH_BYTES
             or self._pending_rows >= SPOOL_FLUSH_ROWS
         ):
-            self._flush_spool(spool)
+            self._publish_batch(spool)
 
-    def _flush_spool(self, spool) -> None:
+    def _publish_batch(self, spool) -> None:
+        """先把整批完整 flush 到 spool，再在条件锁内发布序列号。
+
+        发布之后，这批行对所有订阅者（含即将加入者）都可经 spool 读取；
+        发布之前没有任何订阅者能看到它们。行的可见性只在这里切换一次，
+        因此加入时刻与扫描进度任意交错都不会丢行或重行。
+        """
         if not self._pending:
             return
         chunk = b"".join(self._pending)
+        rows_in_batch = self._pending_rows
         spool.write(chunk)
         spool.flush()
         self._pending.clear()
         self._pending_bytes = 0
         self._pending_rows = 0
         with self.cond:
-            self.spool_size = spool.tell()
+            self.published_seq += rows_in_batch
             self.cond.notify_all()
 
     def _enter_aborted(self) -> None:
@@ -506,6 +492,8 @@ class ScanManager:
                 if ctl.state != "running" or ctl._stop_requested:
                     ctl = self._new_controller(source_id, int(source["row_delay_ms"]))
                     sub = Subscriber(state, ctl, self.db)
+                # 挂载瞬间：published_seq 之前的行全部已在 spool，
+                # 之后的行发布时会唤醒本订阅者，序列号区间首尾相接。
                 ctl.subscribers.add(sub)
                 ctl.cond.notify_all()
             state.status = "running"
